@@ -1,0 +1,269 @@
+library(Seurat)
+library(plyr)
+library(ggplot2)
+library(DropletUtils)
+library(beepr)
+library(celda)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(scDblFinder)
+library(stringr)
+library(dplyr)
+require(formulaic)
+source('source/functions scan_seq.R')
+HB_genes <- c("HBA1","HBA2","HBB","HBD","HBE1","HBG1","HBG2","HBM","HBQ1","HBZ")
+load("source/cc.genes.updated.2019.rda")
+source("source/colors/colors.R")
+
+#
+# 2.import file-----------------------------------------------------------------
+#
+metadata <- read.csv('SraRunTable.csv',
+                     sep = ',', header=T)
+# metadata <- metadata[metadata$tissue == 'ileal',]
+
+list_data <- list()
+setwd("GSE247264")
+for(i in unique(newseu)){
+  files <- grep(i,list.files('D:/Files/bishe/Modle/GSE247264'), value = T)
+  print(files)
+  from1 = files
+  to1 = c('barcodes.tsv', 'genes.tsv', 'matrix.mtx')
+  file.rename(from1, to1)
+  
+  
+  sce2 <- Read10X('D:/Files/bishe/Modle/GSE247264/')
+  
+  m4 <- data.frame('sample' = rep(i, ncol(sce2)),
+                   'State' = rep(metadata$disease_state[metadata$Sample.Name == i][1], ncol(sce2)))
+  
+  rownames(m4) <- colnames(sce2)
+  
+  data <- CreateSeuratObject(
+    sce2, min.features = 100,
+    project = i,
+    assay = "RNA",
+    meta.data = m4
+  )
+  data[["percent.mt"]] <- PercentageFeatureSet(object = data, pattern = "^MT-")
+  HB_m <- match(HB_genes,rownames(data@assays$RNA))
+  HB_genes <- rownames(data@assays$RNA)[HB_m]
+  HB_genes <- HB_genes[!is.na(HB_genes)]
+  data[["percent.HB"]] <- PercentageFeatureSet(object = data, features = HB_genes)
+  
+  file.rename(from = to1, to = from1)
+  list_data[[i]] <- data
+}
+setwd("D:/Files/bishe/Modle")
+
+seudata <- list_data[[1]]
+for(i in 2:length(unique(metadata$Sample.Name))){
+  seudata <- merge(seudata, list_data[[i]])
+}
+rm(data,list_data,m4,metadata,sce2,files,from1,i,to1,HB_genes,HB_m,cc.genes.updated.2019)
+
+group = seudata@meta.data$State
+group = ifelse(str_detect(group,"healthy control"), "HC", #\\d表示数字（可看作0-9），+代表多个
+               ifelse(str_detect(group,"ulcerative colitis"),"UC","CD"))
+table(group)
+seudata$group = group
+seudata$group[1:5]
+
+seudata_f <- subset(seudata,
+                    subset = nFeature_RNA > 100 &
+                      percent.mt < 20 &
+                      percent.HB < 10)
+
+rm(seudata,group)
+
+# 1. Normalize
+seudata_f <- NormalizeData(seudata_f)
+seudata_f[["RNA"]] <- JoinLayers(seudata_f[["RNA"]])
+
+
+
+# 高效计算每个样本的基因平均表达矩阵（默认使用 slot = "data"，即 log-normalized 数据）
+avg_expr <- AggregateExpression(seudata_f, group.by = "sample", assays = "RNA", slot = "data")
+
+# 提取矩阵并写入 CSV
+write.csv(avg_expr$RNA, file = "14CD8UC.csv")
+
+
+
+
+
+# 给定需要检索的基因名顺序
+gene_order <- c("PYCARD", "ICAM1", "STAT1", "IL1B", "JAK3", "PECAM1", "IGHG1", 
+                "JUN", "PFN1", "STAT1", "TGFB1", "RARRES2", "NRG1", "FASLG", 
+                "IL2", "IL6", "TNF", "CDH1", "SELE", "CSF3", "IL1B")
+
+# 假设csv_files是你要处理的CSV文件路径列表
+csv_files <- c("D:\\Files\\bishe\\Modle\\csvs\\6HC6CD6UC.csv", 
+               "D:\\Files\\bishe\\Modle\\csvs\\14CD8UC.csv", 
+               "D:\\Files\\bishe\\Modle\\csvs\\32HC12CD22UC.csv")
+
+# 创建一个空列表存储新生成的数据
+new_expr_list <- list()
+
+# 读取每个CSV文件并根据基因名重新排序
+for (file in csv_files) {
+  # 读取CSV文件，假设基因名在行名（row.names = 1）
+  expr <- read.csv("D:\\Files\\bishe\\Modle\\csvs\\14CD8UC.csv", check.names = FALSE)
+  
+  # 检查文件中是否包含所有需要的基因名
+  missing_genes <- setdiff(gene_order, expr[,1])
+  if (length(missing_genes) > 0) {
+    message(paste("文件", file, "缺少基因：", paste(missing_genes, collapse = ", ")))
+  }
+  
+  # 根据gene_order中的基因名顺序重新排序
+  expr_sorted <- expr[gene_order[gene_order %in% expr[,1]], , drop = FALSE]
+  
+  # 存储排序后的数据
+  new_expr_list[[file]] <- expr_sorted
+}
+
+# 查看结果，打印排序后的第一个文件
+print(new_expr_list[[2]])
+
+# 如果你需要将新表格保存为CSV文件，可以使用write.csv
+write.csv(new_expr_list[[1]], "sorted_file1.csv", row.names = TRUE)
+
+
+
+
+
+
+
+
+
+expr_filtered <- expr[expr[, 1] %in% gene_order, , drop = FALSE]
+
+# 如果你想按gene_order中的顺序重新排序，可以这样做：
+expr_filtered <- expr_filtered[match(gene_order, expr_filtered[, 1]), , drop = FALSE]
+
+# 查看筛选后的数据
+head(expr_filtered)
+
+# 如果需要，可以将筛选后的数据保存为新的CSV文件
+write.csv(expr_filtered, "filtered_expr2.csv", row.names = FALSE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+expr1 <- read.csv("D:/Files/bishe/Modle/hstjdy/6HC6CD6UC.csv", row.names = 1)  # 比如来自CD病人
+expr2 <- read.csv("D:/Files/bishe/Modle/hstjdy/14CD8UC.csv", row.names = 1)  # 来自健康人群
+expr3 <- read.csv("D:/Files/bishe/Modle/hstjdy/32HC12CD22UC.csv", row.names = 1)
+
+expr_all <- cbind(expr1, expr2, expr3)
+
+batch <- c(rep("batch1", ncol(expr1)),
+           rep("batch2", ncol(expr2)),
+           rep("batch3", ncol(expr3)))
+
+expr_log <- log2(expr_all + 1)
+
+# ===== 6. 执行 ComBat 批次效应校正 =====
+expr_combat <- ComBat(dat = expr_log, 
+                      batch = batch, 
+                      par.prior = TRUE, 
+                      prior.plots = FALSE)
+
+
+
+
+
+# 安装必要的包（如未安装请取消注释）
+# install.packages("randomForest")
+# install.packages("caret")
+
+library(randomForest)
+library(caret)
+
+# -------- Step 1: 准备表达矩阵 --------
+# 假设你已经有表达矩阵 expr_mat，行为基因，列为样本
+# 示例: expr_mat <- read.csv("your_merged_file.csv", row.names = 1)
+
+# -------- Step 2: 提取标签并转置矩阵 --------
+# 提取标签（去掉如 CD.1 中的 .1）
+sample_names <- colnames(expr_combat)
+labels <- sub("\\..*", "", sample_names)  # 保留CD、UC、HC
+
+# 转置矩阵：样本为行，基因为列
+expr_mat_t <- t(expr_combat)
+
+# 构建数据框并添加标签
+data_df <- as.data.frame(expr_mat_t)
+data_df$label <- as.factor(labels)
+
+# -------- Step 3: 划分训练集和测试集 --------
+set.seed(123)  # 确保结果可复现
+trainIndex <- createDataPartition(data_df$label, p = 0.8, list = FALSE)
+train_data <- data_df[trainIndex, ]
+test_data <- data_df[-trainIndex, ]
+
+# -------- Step 4: 构建随机森林模型 --------
+rf_model <- randomForest(label ~ ., data = train_data, ntree = 500, importance = TRUE)
+
+# -------- Step 5: 模型评估 --------
+preds <- predict(rf_model, newdata = test_data)
+conf_matrix <- confusionMatrix(preds, test_data$label)
+print(conf_matrix)
+
+# -------- Step 6: 查看最重要的基因 --------
+importance_vals <- importance(rf_model)
+top_genes <- head(sort(importance_vals[, 1], decreasing = TRUE), 20)
+print("Top important genes:")
+print(top_genes)
+
+saveRDS(rf_model, file = "rf_model.rds")
+
+
+
+
+library(pROC)
+library(ggplot2)
+library(reshape2)
+
+# 将 label 转换为 factor 并 one-hot 编码
+test_labels <- as.factor(test_data$label)
+test_labels_onehot <- model.matrix(~ test_labels - 1)
+
+# 预测概率
+pred_probs <- predict(rf_model, test_data, type = "prob")
+
+# 计算 ROC 曲线
+roc_list <- list()
+auc_list <- numeric(ncol(pred_probs))
+for (i in 1:ncol(pred_probs)) {
+  roc_list[[i]] <- roc(test_labels_onehot[, i], pred_probs[, i])
+  auc_list[i] <- auc(roc_list[[i]])
+}
+
+
+# 可视化 ROC 曲线
+pdf("roc_plot.pdf", width = 7, height = 7)
+plot(roc_list[[1]], col = "red", main = "ROC Curves for IBD", legacy.axes = TRUE)
+for (i in 2:length(roc_list)) {
+  plot(roc_list[[i]], add = TRUE, col = i + 1)
+}
+
+
+# 添加图例
+legend("bottomright", legend = paste(colnames(pred_probs), "AUC =", round(auc_list, 2)), col = 2:(length(roc_list) + 1), lwd = 2)
+dev.off()
+
+
+
