@@ -1,0 +1,1207 @@
+#
+# 1.library------------------------------------------------------------------------
+#
+library(Seurat)
+library(plyr)
+library(ggplot2)
+library(DropletUtils)
+library(beepr)
+library(celda)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(scDblFinder)
+library(stringr)
+library(dplyr)
+require(formulaic)
+source('source/functions scan_seq.R')
+HB_genes <- c("HBA1","HBA2","HBB","HBD","HBE1","HBG1","HBG2","HBM","HBQ1","HBZ")
+load("source/cc.genes.updated.2019.rda")
+source("source/colors/colors.R")
+
+#
+# 2.import file-----------------------------------------------------------------
+#
+metadata <- read.csv('SraRunTable.csv',
+                     sep = ',', header=T)
+# metadata <- metadata[metadata$tissue == 'ileal',]
+
+list_data <- list()
+setwd("GSE214695")
+for(i in unique(metadata$Sample.Name)){
+  files <- grep(i,list.files('D:/Files/bishe/F/GSE214695'), value = T)
+  print(files)
+  from1 = files
+  to1 = c('barcodes.tsv', 'genes.tsv', 'matrix.mtx')
+  file.rename(from1, to1)
+  
+  
+  sce2 <- Read10X('D:/Files/bishe/F/GSE214695/')
+  
+  m4 <- data.frame('sample' = rep(i, ncol(sce2)),
+                   'State' = rep(metadata$disease_state[metadata$Sample.Name == i][1], ncol(sce2)))
+  
+  rownames(m4) <- colnames(sce2)
+  
+  data <- CreateSeuratObject(
+    sce2, min.features = 100,
+    project = i,
+    assay = "RNA",
+    meta.data = m4
+  )
+  data[["percent.mt"]] <- PercentageFeatureSet(object = data, pattern = "^MT-")
+  HB_m <- match(HB_genes,rownames(data@assays$RNA))
+  HB_genes <- rownames(data@assays$RNA)[HB_m]
+  HB_genes <- HB_genes[!is.na(HB_genes)]
+  data[["percent.HB"]] <- PercentageFeatureSet(object = data, features = HB_genes)
+  
+  file.rename(from = to1, to = from1)
+  list_data[[i]] <- data
+}
+setwd("D:/Files/bishe/F")
+
+seudata <- list_data[[1]]
+for(i in 2:length(unique(metadata$Sample.Name))){
+  seudata <- merge(seudata, list_data[[i]])
+}
+rm(data,list_data,m4,metadata,sce2,files,from1,i,to1,HB_genes,HB_m,cc.genes.updated.2019)
+
+group = seudata@meta.data$State
+group = ifelse(str_detect(group,"healthy control"), "HC", #\\d表示数字（可看作0-9），+代表多个
+               ifelse(str_detect(group,"ulcerative colitis"),"UC","CD"))
+table(group)
+seudata$group = group
+seudata$group[1:5]
+
+#
+# 3.Normalize-------------------------------------------------------------------
+#
+VlnPlot(seudata, features = c('percent.mt', 'percent.HB', 'nFeature_RNA', 'nCount_RNA'), group.by = 'group', pt.size = 0)
+VlnPlot(seudata[, seudata$percent.mt < 20 & seudata$nFeature_RNA > 100 & seudata$percent.HB < 3 & seudata$nCount_RNA < quantile(seudata$nCount_RNA,0.97)],
+        features = c('percent.mt', 'nFeature_RNA', 'nCount_RNA', 'percent.HB'), group.by = 'group', pt.size = 0)
+
+seudata_f <- subset(seudata,
+                    subset = nFeature_RNA > 100 &
+                      percent.mt < 20 &
+                      percent.HB < 10)
+
+rm(seudata,group)
+seudata_f <- seurat_to_pca(seudata_f)
+
+#
+# 4.Integration-----------------------------------------------------------------
+#
+seurat_int <- IntegrateLayers(object = seudata_f,
+                                     method = HarmonyIntegration,
+                                     orig.reduction = "pca",
+                                     new.reduction = "harmony",
+                                     verbose = F)
+rm(seudata_f)
+
+seurat_int[["RNA"]] <- JoinLayers(seurat_int[["RNA"]])
+
+#
+# 5.Clustering------------------------------------------------------------------
+#
+
+cPCS2 <- select_pcs_auto(seurat_int) 
+PCS2 = cPCS2[2]
+p <- ElbowPlot(seurat_int, ndims = 100) +
+  geom_vline(xintercept = 25, colour="#BB0000")+
+  annotate(geom="text", x=20, y=4, label= paste("sdev > ",cPCS2[1],"; PCs =", cPCS2[2]),
+           color="#BB0000")
+p
+ggsave(p, file = 'Pic/elbowplot_Cho.pdf',width = 10, height = 4)
+
+seurat_int <- FindNeighbors(object = seurat_int,
+                                   reduction = "harmony",
+                                   dims = 1:PCS2,
+                                   verbose = FALSE) 
+seurat_int <- RunUMAP(object = seurat_int, 
+                             dims = 1:PCS2, reduction = "harmony")
+seurat_int <- RunTSNE(object = seurat_int, 
+                             dims = 1:PCS2, reduction = "harmony")
+dir.create('resolutions1')
+seurat_int <- resolutions(seurat_int, resolutions = 0.01, workingdir = 'resolutions1', title = 'resolutions')
+seurat_int <- resolutions(seurat_int, workingdir = 'resolutions', title = 'resolutions')
+seurat_int$RNA_snn_res.0.1
+
+Idents(seurat_int) <- "RNA_snn_res.0.1"
+
+save(seurat_int,file = "seurat_int_raw")
+
+umap_integrated1 <- DimPlot(seurat_int,reduction = "umap",group.by = "orig.ident")
+umap_integrated2 <- DimPlot(seurat_int,reduction = "umap",group.by = "group")
+tsne_integrated3 <- DimPlot(seurat_int,reduction = "tsne",label = T)
+umap_integrated4 <- DimPlot(seurat_int,reduction = "umap",label = T)
+library(patchwork)
+umap_tsne_integrated <- umap_integrated1 + umap_integrated2 +tsne_integrated3 + umap_integrated4
+umap_tsne_integrated
+ggsave("Pic/umap_tsne_integrated.pdf",umap_tsne_integrated,wi=25,he=15)
+
+s.genes <- cc.genes$s.genes
+g2m.gens <- cc.genes$g2m.genes
+seurat_int <- CellCycleScoring(seurat_int,
+                                      s.features = s.genes,
+                                      g2m.features = g2m.gens,
+                                      set.ident = T)
+DimPlot(seurat_int, label = TRUE, group.by = "Phase")
+DimPlot(seurat_int, label = TRUE, group.by = "Phase",reduction = "pca")
+#具有一定连续性、重合度即为正常，无需回归。若需要，运行：
+# seurat_integrated <- ScaleData(seurat_integrated,vars.to.regress = c("S.Score","G2M.Score"),
+#                                features = rownames(sce_Scale))
+
+rm(umap_integrated1, umap_integrated2, tsne_integrated3, umap_integrated4,
+   umap_tsne_integrated, g2m.gens, s.genes)
+
+#
+# 7. Marker identification (cluster annotation)----
+#
+
+#load("harmony_raw")
+Idents(seurat_int) <- "RNA_snn_res.1.1"
+Idents(seurat_int)
+seurat_int$seurat_clusters = Idents(seurat_int)
+seurat_int$seurat_clusters
+
+DimPlot(seurat_int,reduction = "umap",label = T)
+# 找出每个聚类相对于其他聚类的差异表达
+markers <- FindAllMarkers(object = seurat_int, 
+                          only.pos = TRUE, #只返回表达上调的基因
+                          logfc.threshold = 0.25) #对数倍变化至少为 0.25
+
+#筛选
+all.markers <- markers %>% dplyr::select(gene,everything()) %>% subset(p_val < 0.05)
+top5 <- all.markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+View(top20)
+write.csv(top20,"30cluster_top20.csv",row.names = T)
+#http://117.50.127.228/CellMarker/index.html
+
+Tcell_unknow <- seurat_int[,seurat_int$RNA_snn_res.1.1 %in% c("11","12")]
+
+DoHeatmap(seurat_int,features = top5$gene) + NoLegend()
+VlnPlot(seurat_int,features = top5$gene[1:10])
+# VlnPlot(seurat_integrated,features = c("","",""))
+
+View(seurat_int@meta.data)
+table(seurat_int@meta.data$seurat_clusters)
+
+
+# #整理的一些marker
+file.edit("com_genes.R")
+library(ggplot2)
+
+genes_to_check = c("RGL4","ADH1C")
+DotPlot(seurat_int,features = genes_to_check,
+             assay = "RNA",group.by = "seurat_clusters") + coord_flip() + ggtitle("")
+
+
+metadata <- data.frame(
+  stringsAsFactors = FALSE,
+  clusters = c(0L,1L,2L,3L,4L,5L,6L,7L,8L,9L,10L,11L,12L,13L,14L,15L,16L,17L,18L,
+               19L,20L,21L,22L,23L,24L,25L,26L,27L,28L,29L),
+  int_cho_res_1.1 = c('T cells',
+                      "B and PC","B and PC","T cells","B and PC","Epithelium",
+                      "T cells","Myeloid cells","T cells","B and PC","T cells",
+                      "T cells","Epithelium","Stroma","T cells","Epithelium",
+                      "Epithelium","T cells","Myeloid cells","T cells","T cells",
+                      "Epithelium","Stroma","Stroma","Epithelium","Stroma",
+                      "B and PC","Stroma","Stroma","B and PC")
+)
+
+seurat_int$celltype_big <- mapvalues(seurat_int$RNA_snn_res.1.1,
+                                             from = metadata$clusters,
+                                             to = metadata$int_cho_res_1.1)
+bar1 <- barplot_proportion(seurat_int,celltype = "updated_annotation", color = cols_plasmas[1:6])
+ggsave("Pic/celltype_propotion.pdf",bar1,width = 5,height = 5)
+DimPlot(seurat_int, group.by = 'updated_annotation', label=T)
+Idents(seurat_int) <- seurat_int$celltype_fin
+
+
+markers <- FindAllMarkers(seurat_int, only.pos = T,
+                          min.pct = 0.25, thresh.use = 0.25)
+markers <- markers[markers$p_val < 0.05,]
+dat_list <- list()
+for(i in 1:length(levels(markers$cluster))){
+  genes <- as.character(markers$gene[markers$cluster == levels(markers$cluster)[i]])
+  dat_list[[i]] <- genes
+  names(dat_list)[i] <-  levels(markers$cluster)[i]
+}
+
+save(seurat_int, file = "seurat_int")
+save(dat_list, file = "marker_seurat_int")
+
+####Exploration Analysis####
+# 1. SingleR----
+
+library(celldex)
+library(SingleR)
+
+ls("package:celldex")
+#[1] "BlueprintEncodeData"  人类免疫细胞           
+#[2] "DatabaseImmuneCellExpressionData"  人类免疫细胞
+#[7] "HumanPrimaryCellAtlasData"  人广泛细胞类型注释
+#[8] "ImmGenData"  小鼠免疫细胞
+#[11] "MonacoImmuneData"  人免疫细胞         
+#[12] "MouseRNAseqData" 小鼠单细胞广泛细胞    
+#[13] "NovershternHematopoieticData"  人类血液
+
+#加载HumanPrimaryCellAtlasData数据集
+HumanPrimaryCellAtlas <- HumanPrimaryCellAtlasData()
+
+#加载降维聚类后未注释的数据
+load("datas/harmony_raw")
+p1 = DimPlot(seurat_integrated,label = T)
+p1
+scRNA_sr <- seurat_int
+rm(seurat_integrated)
+
+#提取data数据
+test <- GetAssayData(scRNA_sr,layer = "data")
+
+#显示当前scRNA_sr对象中各cluster的细胞数
+table(scRNA_sr@active.ident)
+
+
+
+#使用SingleR进行细胞类型注释
+Rename_scRNA <- SingleR(
+  test = test,                                    #目标数据
+  ref = HumanPrimaryCellAtlas,                    #参考数据集
+  labels = HumanPrimaryCellAtlas$label.main,      #使用粗粒度的标注信息，细粒度：lable.fine
+  clusters = scRNA_sr@active.ident                #根据scRNA_sr中的cluster注释
+)
+
+#查看注释后的细胞类型标签
+Rename_scRNA$labels         #输出每个cluster的标注结果
+Rename_scRNA$delta.next     #表示每个cluster第二高的匹配度
+#较大的delta.next值表明更高置信度，因为第一和第二分数差距大
+Rename_scRNA$pruned.labels  #输出除去低置信度的标注标签
+
+#更新scRNA_sr对象中cluster名称
+new.cluster.ids <- Rename_scRNA$pruned.labels       #获取最终注释结果
+names(new.cluster.ids) <- levels(scRNA_sr)          #将cluster名称赋予new.cluster.ids
+scRNA_sr <- RenameIdents(scRNA_sr,new.cluster.ids)  #重命名scRNA_sr中的cluster
+Idents(scRNA_sr)
+#新增一列celltype保存注释结果
+scRNA_sr$celltype_singleR = Idents(scRNA_sr)
+
+#绘制uamp图
+p2 <- DimPlot(scRNA_sr, 
+              reduction = "umap", 
+              label = TRUE, 
+              pt.size = 0.5,
+              group.by = "celltype_singleR") + NoLegend()
+p2
+p1+p2
+#查看注释结果的热图
+plotScoreHeatmap(Rename_scRNA) 
+
+# 2. GSVA----
+##细胞评分，参考：gsea分子特征数据库：https://www.gsea-msigdb.org/gsea/msigdb
+#BiocManager::install("")
+library(SingleCellExperiment)
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(cowplot)
+library(RCurl)
+library(metap)
+library(stringr)
+library(dplyr)
+library(purrr)
+library(gplots)
+library(ggplot2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(GSVA)
+library(GSEABase)
+library(dendextend)
+library(circlize)
+library(RColorBrewer)
+library(ComplexHeatmap)
+
+
+
+load("datas/seurat_integrated")
+DimPlot(seurat_integrated)
+
+# 1.准备单细胞平均表达值矩阵
+colnames(seurat_int@meta.data)
+
+seurat_int$No <- 1:ncol(seurat_int)
+
+#获取celltype_epi的平均表达值
+expr <- AverageExpression(seurat_int,
+                          group.by = "sample",
+                          assays = "RNA",
+                          slot = "data")
+expr = expr[[1]]
+expr <- expr[rowSums(expr)>0,]
+expr <- as.matrix(expr)
+head(expr)
+write.csv(expr,file = "csv/gsva_averagexpression.csv")
+
+cg = names(tail(sort(apply(expr,1,sd)),1000)) #找到expr中标准差最高的1000个基因
+#apply(expr,1,sd)计算expr中每行的标准差
+pheatmap::pheatmap(cor(expr[cg,]))
+pheatmap::pheatmap(cor(expr[cg,]),
+                   file = "PDFS/AverageExpression.pdf")
+
+# 2.下载基因集
+library(msigdbr)
+all_gene_sets = msigdbr(species = "Homo sapiens",
+                        category = "H")
+gs = split(all_gene_sets$gene_symbol,all_gene_sets$gs_name)
+gs = lapply(gs,unique)
+#将基因集转换为GeneSetCollection对象
+genesets <- GeneSetCollection(mapply(function(geneIds,keggId){
+  GeneSet(geneIds,geneIdType = EntrezIdentifier(),
+          collectionType = KEGGCollection(keggId),
+          setName = keggId)
+},gs,names(gs)))
+genesets
+
+# 3.GSVA分析
+param <- gsvaParam(
+  exprData = as.matrix(expr),  # 确保输入是矩阵
+  geneSets = genesets,         # GeneSetCollection 对象
+  maxDiff = FALSE             # 注意参数名从 mx.diff 改为 maxDiff
+)
+gsva_result <- gsva(param)
+write.csv(gsva_result,file = "csv/gsva_result.csv")
+head(gsva_result)
+
+
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(circlize)
+
+# 分组信息
+group <- factor(rep(c("HC","UC","CD"), each = 6))
+annotation <- data.frame(group = group)
+rownames(annotation) <- colnames(expr)
+
+# 确保颜色映射正确，命名必须与annotation$group的列名一致
+group_colors <- c("HC" = "#70AD96","UC" = "#CCA551","CD" = "#515073")
+topannotation <- HeatmapAnnotation(df = annotation,
+                                   col = list(group = group_colors))
+
+# 数据标准化（行Z-score）
+gsva_scaled <- t(scale(t(gsva_result)))
+
+# 获取真实数值范围用于颜色映射
+min_val <- min(gsva_scaled, na.rm = TRUE)
+max_val <- max(gsva_scaled, na.rm = TRUE)
+values <- seq(min_val, max_val, length.out = 100)
+colors <- colorRampPalette(rev(brewer.pal(n = 11, name = "RdYlBu")))(length(values))
+col_fun <- colorRamp2(values, colors)
+
+# 热图绘制
+pdf("pic/gsva_heatmap.pdf",width = 5,height = 10)
+Heatmap(gsva_scaled,
+        name = "GSVA",
+        col = col_fun,
+        cluster_rows = TRUE,
+        cluster_columns = F,
+        cluster_column_slices = T,   # 组内聚类
+        column_split = annotation$group,
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        top_annotation = topannotation)
+dev.off()
+
+
+
+
+
+
+
+# 可视化
+library(pheatmap)
+pheatmap(gsva_result)
+pheatmap(gsva_result,show_rownames = F)
+ggsave("PDFS/pheatmap_by_GSVA_all.pdf",width = 7,height = 5)
+
+pheatmap(gsva_result,show_colnames = T,
+         scale = "row",angle_col = "45",
+         color = colorRampPalette(c("navy","white","firebrick3"))(50))
+dev.off()
+
+#气泡图
+library(reshape2)
+gsva_long <- melt(gsva_result,id.vars = "Genesets")
+ggplot(gsva_long,aes(x = Var2, y = Var1, size = value, color = value)) +
+  geom_point(alpha = 0.7) + #用散点图绘制气泡，alpha设置点的透明度
+  scale_size_continuous(range = c(1,6)) + #设置气泡大小范围
+  theme_minimal() +
+  scale_color_gradient(low = "#008020",high = "#08519c") +
+  labs(x = "Gene Set", y = "Sample", size = "GSVA Score") +
+  theme(axis.text.x = element_text(angle = 45,vjust = 0.5,hjust = 0.5))
+
+#挑选最显著的top5作图
+cg = names(tail(sort(apply(gsva_result,1,sd)),5))
+pheatmap(gsva_result[cg,])
+ggsave("PDFS/cg.pdf",width = 7,height = 5)
+
+# 3. DEG,VP,GO,KEGG----
+load("datas/seurat_integrated")
+library(msigdbr)
+library(gplots)
+library(ggplot2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(Seurat)
+library(enrichplot)
+library(DOSE)
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+sce = seurat_int
+DimPlot(object = sce,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 3,
+        repel = TRUE)
+table(sce$seurat_clusters)
+rm(seurat_int)
+
+###差异分析###
+
+# 1.所有cluster整体的差异分析
+Idents(sce) = "group"
+# 找出每个cluster的标记与所有剩余的细胞比较，only.pos = T只报告阳性细胞
+cell.markers <- FindAllMarkers(object = sce,
+                               only.pos = FALSE,
+                               test.use = "wilcox",
+                               slot = "data",
+                               min.pct = 0.25,
+                               logfc.threshold = 0.25
+)
+#看细胞和cluster分布
+table(sce@meta.data$celltype,sce@meta.data$seurat_clusters)
+
+Epi_cho <- sce[,sce$celltype_big %in% "Epithelium"]
+
+
+
+# 2.两个cluster差异分析
+#pct.1表示在聚类簇1中表达该基因的单细胞占总单细胞样本数的比例
+
+CD_epi_degs = FindMarkers(sce,
+                           logfc.threshold = 0.25,
+                           min.pct = 0.1,
+                           only.pos = FALSE,
+                           ident.1 = "CD",
+                           ident.2 = "HC")%>%
+  mutate(gene = rownames(.))
+
+#自定义筛选
+CD_epi_degs_fil = CD_epi_degs %>%
+  filter(pct.1 > 0.1 & p_val_adj < 0.05)%>%
+  filter(abs(avg_log2FC)>0.5)
+
+#火山图
+library(ggrepel)
+# 查看T细胞差异基因的数据排名
+rownames(CD_epi_degs_fil)
+# 统计绝对平均对数折叠变化大于2的基因数量
+table(abs(CD_epi_degs_fil$avg_log2FC) > 2)
+# 创建用于绘制火山图的数据集
+plotdt = CD_epi_degs_fil %>%
+  mutate(gene = ifelse(abs(avg_log2FC) >= 2, gene, NA))
+
+# capped处理：限制最大y值显示
+plotdt <- plotdt %>%
+  mutate(log10_p = -log10(p_val_adj),
+         log10_p_capped = ifelse(log10_p > 320, 320, log10_p),
+         capped = log10_p > 320)
+
+# 绘制火山图
+p1 <- ggplot(plotdt, aes(x = avg_log2FC, y = log10_p_capped,
+                   size = pct.1, color = avg_log2FC)) +
+  geom_point(aes(shape = capped)) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 17)) +  # 普通点为圆点，截断点为三角形
+  geom_text_repel(aes(label = gene), size = 3, color = "black") +
+  theme_bw() +
+  ggtitle("", subtitle = "") +
+  scale_color_gradient2(
+    low = "olivedrab",
+    high = "salmon2",
+    mid = "grey",
+    midpoint = 0,
+    limits = c(-2, 2),               # 设置颜色范围
+    oob = scales::squish             # 超出范围的颜色压缩到边界
+  ) +
+  scale_size(range = c(1, 3)) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.background = element_rect(fill = "transparent", colour = NA)
+  ) +
+  ylab("-log10(p-value, capped at 300)")
+
+write.csv(plotdt,file = "csv/uc_cd_deg.csv")
+ggsave("Pic/vacno_uc_cd.pdf",p1,width = 7,height = 5)
+
+###GO/KEGG富集###
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+options(timeout = 300)
+UC_vs_HC <- CD_epi_degs_fil
+result <- run_enrichment_analysis(UC_vs_HC)
+ggsave("Pic/uc_vs_hc_go.pdf", result$p1,width = 16,height = 10)
+ggsave("Pic/uc_vs_hc_kegg.pdf", result$p2,width = 10,height = 7)
+write.csv(result$go_res,file = "csv/uc_hc_go.csv")
+write.csv(result$kegg_df,file = "csv/uc_hc_kegg.csv")
+
+###GSEA分析###
+library(snow)
+#为每个基因添加ENTREZID
+CD_epi_degs$gene <- rownames(CD_epi_degs)
+ids = bitr(CD_epi_degs$gene,"SYMBOL","ENTREZID","org.Hs.eg.db")
+##警告信息:
+#In bitr(T_cells_degs$gene, "SYMBOL", "ENTREZID", "org.Hs.eg.db") :
+#4.82% of input gene IDs are fail to map...
+#合并数据，没有ENTREZID的基因过滤掉
+CD_epi_degs = merge(CD_epi_degs,ids,by.x = "gene",by.y = "SYMBOL")
+head(CD_degs)
+
+#将基因按照avg_log2FC值的大小进行降序排列
+CD_epi_degs <- CD_epi_degs[order(CD_epi_degs$avg_log2FC,decreasing = T),]
+#生成仅含有ENTREZID名字和avg_log2FC的gene list
+cluster3.markers_list <- as.numeric(CD_epi_degs$avg_log2FC)
+names(cluster3.markers_list) <- CD_epi_degs$ENTREZID
+head(cluster3.markers_list)
+
+cluster3_gsekg <- gseKEGG(cluster3.markers_list,organism = "hsa",pvalueCutoff = 0.5)
+head(cluster3_gsekg)
+#将富集结果按照NES绝对值降序排列
+cluster3_gsekg_arrange <- arrange(cluster3_gsekg,desc(abs(NES)))
+head(cluster3_gsekg_arrange)
+
+#作图
+library(clusterProfiler)
+library(enrichplot)
+library(ggupset)
+library(cowplot)
+
+library(cowplot)
+library(ggpubr)
+
+# 原始绘图
+colorme <- c("#f7ca64","#43a5bf","#86c697","#a670d6","#ef998a")
+gsekp1 <- gseaplot2(cluster3_gsekg_arrange,
+                    1:5,
+                    color = colorme,
+                    pvalue_table = FALSE,
+                    base_size = 14)
+
+# 提取一个图的图例（所有子图共用图例时，任选其一即可）
+legend <- get_legend(gsekp1[[1]] + theme(legend.position = "right"))
+
+# 去掉每个图中的图例
+gsekp1_nolegend <- lapply(gsekp1, function(p) p + theme(legend.position = "none"))
+
+# 合并图
+combined_gsekp1 <- plot_grid(plotlist = gsekp1_nolegend, ncol = 1, align = "v", axis = "l")
+
+# 将图和图例合并为一个完整图像
+final_plot <- plot_grid(combined_gsekp1, legend, rel_widths = c(4, 1), ncol = 2)
+
+# 展示图像
+print(final_plot)
+ggsave("Pic/gsea_hc_cd.pdf", final_plot,width = 10,height = 7)
+write.csv(cluster3_gsekg_arrange@result,file = "csv/hc_cd_gsea.csv")
+
+# 4. monocle----
+# BiocManager::install(c("BiocGenerics","DelayedArray","DelayedMatrixStats",
+#                        "limma","lme4","S4Vectors","SingleCellExperiment",
+#                        "SummarizedExperiment","batchelor","Matrix.utils",
+#                        "HDF5Array","terra","ggrastr"))
+# install.packages("devtools")
+# devtools::install_github("cole-trapnell-lab/monocle3")
+
+library(Seurat)
+library(monocle3)
+library(tidyverse)
+library(patchwork)
+library(ggpubr)
+library(ggplot2)
+library(magrittr)
+library(RColorBrewer)
+library(reshape2)
+library(Biobase)
+library(ggsci)
+library(data.table)
+
+load("datas/seurat_integrated")
+monoseu <- seurat_int
+rm(seurat_int)
+CD_cells <- monoseu[,monoseu$group %in% "UC"]
+Idents(CD_cells) <- CD_cells$celltype_fin
+DimPlot(CD_cells)
+#根据生物学细胞演进规律，提取相关细胞
+seutype = subset(CD_cells,idents = c( 'PC IgA',
+                                      'Plasma cells',
+                                      'PC IgG'
+                                      
+                                     ))
+
+###monocle3流程###
+expr_matrix <- GetAssayData(seutype,assay = "RNA",layer = "counts") #提取原始数据
+sample_sheet <- seutype@meta.data #细胞元数据
+gene_annotation = data.frame(gene_short_name = rownames(expr_matrix)) #基因注释数据框
+rownames(gene_annotation) = rownames(expr_matrix)
+
+#构建cellDataSet(cds)对象，包括表达矩阵，细胞元数据，基因注释
+cds <- new_cell_data_set(expr_matrix,
+                         cell_metadata = sample_sheet,
+                         gene_metadata = gene_annotation)
+cds <- preprocess_cds(cds,num_dim = 50)
+cds
+# cds <- align_cds(cds,alignment_group = "orig.ident") #去批次（选做）
+cds <- reduce_dimension(cds,preprocess_method = "PCA")
+
+#展示monocle聚类的细胞类型
+p1 = plot_cells(cds,color_cells_by = "celltype_fin",
+                cell_size = 0.5,
+                group_label_size = 5)
+p1
+plot_cells(cds,genes = c("MBP",'GSN','EPCAM','KRT19', 'PROM1', 'ALDH1A1', 'CD24','EpCAM+'),
+           cell_size = 0.5,
+           group_label_size = 5)
+
+#细胞进行聚类分组
+cds <- cluster_cells(cds,resolution = 1e-5)
+plot_cells(cds)
+plot_cells(cds,color_cells_by = "partition",
+           group_cells_by = "partition")
+
+#将monocle3对象与seurat的UMAP降维相结合
+cds.embed <- cds@int_colData$reducedDims$UMAP
+int.enbed <- Embeddings(seutype,reduction = "umap")
+int.enbed <- int.enbed[rownames(cds.embed),]
+cds@int_colData$reducedDims$UMAP <- int.enbed
+
+#cluster聚类
+cds <- cluster_cells(cds,reduction_method = "UMAP",cluster_method = "louvain")
+cds <- learn_graph(cds) #构建细胞轨迹图
+#minimal_branch_len越大分支越少，其他如去批次也会影响分支个数
+cds <- learn_graph(cds,
+                   verbose = T,
+                   learn_graph_control = list(minimal_branch_len = 80))
+
+p = plot_cells(cds,color_cells_by = "celltype_fin",label_groups_by_cluster = F,
+               label_leaves = F, label_branch_points = F)
+p
+ggsave("PDFS/Monocle3.pdf", p, width = 5, height = 4)
+
+#轨迹树
+p0 <- plot_cells(cds,
+           color_cells_by = "celltype_fin",
+           label_groups_by_cluster = F,
+           label_leaves = F,
+           label_branch_points = F,
+           cell_size = 0.5, group_label_size = 4)
+ggsave("Pic/UC_B_mono_cluster.pdf", p0,width = 10,height = 8)
+
+##自动生成起始点
+plot_cells(cds,
+           color_cells_by = "celltype_fin",
+           label_groups_by_cluster = F,
+           label_leaves = T,
+           label_branch_points = T,
+           group_label_size = 4)
+#选择起始点
+cds <- order_cells(cds)
+p1 <- plot_cells(cds,
+           label_cell_groups = F,
+           color_cells_by = "pseudotime",
+           label_leaves = F,
+           label_branch_points = F,
+           group_label_size = 4,
+           cell_size = 0.5, trajectory_graph_segment_size = 2)
+ggsave("Pic/UC_B_mono.pdf", p1,width = 10,height = 8)
+
+#或者函数推断
+get_earliest_principal_node <- function(cds,my_select = "PC IgG"){
+  cell_ids <- which(colData(cds)[,"celltype_fin"] == my_select)
+  closest_vertex <- 
+    cds@principal_graph_aux[["UMAP"]]$pr_graph_cell_proj_closest_vertex
+  closest_vertex <- as.matrix(closest_vertex[colnames(cds), ])
+  root_pr_nodes <- 
+    igraph::V(principal_graph(cds)[["UMAP"]])$name[as.numeric(names(
+      which.max(table(closest_vertex[cell_ids,]))
+    ))]
+  root_pr_nodes
+}
+cds <- order_cells(cds,root_pr_nodes = get_earliest_principal_node(cds))
+p1 <- plot_cells(cds,
+           label_cell_groups = F,
+           color_cells_by = "pseudotime",
+           label_leaves = F,
+           label_branch_points = F,
+           group_label_size = 4,
+           cell_size = 0.5, trajectory_graph_segment_size = 2)
+
+###下游基因分析###
+
+#计算基因按照轨迹的变化
+cds_genes <- graph_test(cds,
+                        neighbor_graph = "principal_graph",cores = 4)
+write.csv(cds_genes, file = "csv/ucs_B_gene.csv")
+
+#gene moducle分析
+res_ids <- row.names(subset(cds_genes,q_value < 0.01))
+gene_module_df <- find_gene_modules(cds[res_ids,],
+                                    resolution = c(10^seq(-6,-1)))
+write.csv(gene_module_df,file = "csv/uc_B_gene_module_df.csv")
+
+cell_group_df <- tibble::tibble(cell = row.names(colData(cds)),
+                                cell_group = colData(cds)$celltype_fin)
+
+agg_mat <- aggregate_gene_expression(cds,
+                                     gene_module_df,
+                                     cell_group_df) #计算基因平均表达量
+
+row.names(agg_mat) <- stringr::str_c("Module",row.names(agg_mat))
+#moducle热图
+pheatmap::pheatmap(agg_mat,
+                   scale = "column", clustering_method = "ward.D2")
+
+#gene随拟时变化
+genes_sig <- cds_genes %>% top_n(n = 10,morans_I) %>% 
+  pull(gene_short_name) %>% as.character()
+#显示celltype
+plot_genes_in_pseudotime(cds[genes_sig,],color_cells_by = "celltype_fin",
+                         min_expr = 0.5,ncol = 2)
+#显示拟时
+p2 <- plot_genes_in_pseudotime(cds[genes_sig,],color_cells_by = "pseudotime",
+                         min_expr = 0.5,ncol = 2)
+ggsave("Pic/UC_B_mono_gene.pdf", p2,width = 10,height = 10)
+#直接将基因表达用UMAP显示
+p3 <- plot_cells(cds,genes = genes_sig,show_trajectory_graph = F,
+           label_cell_groups = F, label_leaves = F)
+ggsave("Pic/UC_B_mono_umap.pdf", p3,width = 12,height = 10)
+
+#
+library(viridis)
+plot_cells(cds,
+           genes = c("PLP1"),
+           label_cell_groups = F,
+           show_trajectory_graph = T,
+           cell_size = 1, trajectory_graph_color = "black",
+           label_branch_points = F,
+           label_roots = F, label_leaves = F) +
+  scale_color_viridis(option = "inferno")
+
+# 5. cellchat----
+
+# devtools::install_github("satijalab/seurat-data")
+# devtools::install_github("sqjin/CellChat")
+# #http://seurat.nygenome.org/src/contrib/ifnb.SeuratData_3.1.0.tar.gz
+# install.packages("D:/Edge Download/ifnb.SeuratData_3.1.0.tar.gz")
+
+library(Seurat)
+library(SeuratData)
+library(ifnb.SeuratData)
+library(RColorBrewer)
+library(dplyr)
+library(magrittr)
+library(CellChat)
+library(patchwork)
+library(tidydr)
+
+load("seurat_int_fin")
+ifnb = seurat_int
+rm(seurat_int)
+View(ifnb@meta.data)
+head(ifnb@meta.data)
+table(ifnb@meta.data$group)
+# CTRL STIM 
+# 6548 7451 
+ifnb = UpdateSeuratObject(object = ifnb)
+
+
+#拆分成实验和对照两组
+ifnb.list <- SplitObject(ifnb,split.by = "group")
+ifnb.list
+
+#对两个数据集单独进行normalize并识别各自的高变异基因
+ifnb.list <- lapply(X = ifnb.list, FUN = function(x){
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x,selection.method = "vst", nfeatures = 2000)
+})
+
+#计算两个数据中排完rank后top2000的高变基因
+features <- SelectIntegrationFeatures(object.list = ifnb.list, nfeatures = 2000)
+
+#使用上述高变基因在两个基因集中分别执行PCA
+ifnb.list <- lapply(X = ifnb.list, FUN = function(x){
+  x <- ScaleData(x, features = features, verbose = T)
+  x <- RunPCA(x, features = features, verbose = T)
+})
+
+##对两个数据进行整合
+#首先使用FindIntegrationAnchors标识锚点，然后用IntegrateData将两数据集整合在一起
+# k.anchor越大，整合强度越强
+immune.anchors <- FindIntegrationAnchors(object.list = ifnb.list,
+                                         anchor.features = features,
+                                         reduction = "rpca",
+                                         k.anchor = 20)
+immune.combined <- IntegrateData(anchorset = immune.anchors)
+
+#对整合后的数据进行后续分析
+DefaultAssay(immune.combined) <- "integrated"
+
+#常规流程，scale数据，跑PCA，使用前30个PC进行降维跑UMAP，计算Neighbors，分cluster
+immune.combined <- ScaleData(immune.combined, verbose = F)
+immune.combined <- RunPCA(immune.combined, npcs = 30, verbose = F)
+immune.combined <- RunUMAP(immune.combined, dims = 1:30, reduction = "pca")
+immune.combined <- FindNeighbors(immune.combined,
+                                 reduction = "pca",
+                                 dims = 1:30) 
+immune.combined <- FindClusters(immune.combined, resolution = 0.5)
+
+DefaultAssay(immune.combined) <- "RNA"
+Idents(immune.combined) <- "celltype_fin"
+
+#可视化
+p1 <- DimPlot(immune.combined, reduction = "umap", group.by = "group")
+p2 <- DimPlot(immune.combined, reduction = "umap",
+              group.by = "celltype_fin",
+              label = T)
+p1 + p2
+saveRDS(immune.combined,"immune.combined.rds")
+
+##STIM组cellchat分析
+#提取数据创建CellChat对象
+immune.combined = readRDS("immune.combined.rds")
+stim.object <- subset(immune.combined, group == "CD") #
+stim.data.input <- GetAssayData(stim.object, assay = "RNA", slot = "data") #
+stim.meta <- stim.object@meta.data[,c("celltype_fin","group")] #
+stim.meta$CellType %<>% as.vector(.)
+
+## cellchat对象构建，需要两个数据
+#第一是表达矩阵
+#第二是metadata数据，包含分组和细胞类型即可
+stim.cellchat <- createCellChat(object = stim.data.input) #也可以是seurat对象
+stim.cellchat <- addMeta(stim.cellchat, meta = stim.meta) #分组信息
+stim.cellchat <- setIdent(stim.cellchat, ident.use = "celltype_fin")
+
+levels(stim.cellchat@idents)
+groupSize <- as.numeric(table(uc.cellchat@idents)) #各种类型细胞的数量
+groupSize
+
+#CellChat提供的人的配受体数据库
+stim.cellchat@DB <- CellChatDB.human ##鼠的用CellChatDB.mouse
+showDatabaseCategory(CellChatDB.human) #1.旁分泌、自分泌；2.胞外基质-受体；3.细胞直接互作
+dplyr::glimpse(CellChatDB.human$interaction)
+
+options(future.globals.maxSize = 1000 * 1024^2)
+stim.cellchat <- subsetData(stim.cellchat, features = NULL) #feature选感兴趣的基因
+future::plan("multisession", workers = 5) #线程数不要太大
+stim.cellchat <- identifyOverExpressedGenes(stim.cellchat) #寻找高表达基因（配体-受体）
+stim.cellchat <- identifyOverExpressedInteractions(stim.cellchat) #寻找高表达互作（通路）
+stim.cellchat <- projectData(stim.cellchat, PPI.human) #鼠的用PPI.mouse
+
+##cellchat分析
+#通过计算与每个信号通路相关的所有配体-受体互作概率推断信号通路水平上的通信
+library(future)
+plan("sequential")  # 关闭并行
+stim.cellchat <- computeCommunProb(stim.cellchat, raw.use = TRUE)
+
+#过滤掉小于10个细胞的细胞间通讯网络，没有意义
+stim.cellchat <- filterCommunication(stim.cellchat, min.cells = 10)
+#通过汇总所有相关配体、受体，计算信号通路水平上的通信概率
+stim.cellchat <- computeCommunProbPathway(stim.cellchat)
+stim.cellchat <- aggregateNet(stim.cellchat)
+#netP表示推断的信号通路的细胞间通讯网络
+stim.cellchat <- netAnalysis_computeCentrality(stim.cellchat, slot.name = "netP")
+group1.net <- subsetCommunication(uc.cellchat)
+write.csv(group1.net, file = "csv/uc_cellchat.csv")
+saveRDS(stim.cellchat, "cd_cellchat.rds")
+
+
+###结果可视化
+#互作网络
+par(mfrow = c(1,2))
+cells.use <- c("CD4 positive αβ T cells",
+               "Plasma cells","DN EOMES","Keratinocytes",
+               
+               "Intestinal tuft cells",
+               "Pericytes","Blood vessel endothelial cells","Fibroblasts",
+               "B cells","Enteroendocrine cells")  # 这里换成你的细胞名
+
+# 2. 从完整矩阵中提取感兴趣的细胞子集
+mat.use <- stim.cellchat@net$count[cells.use, cells.use]
+mat.use2 <- stim.cellchat@net$weight[cells.use, cells.use]
+rownames(mat.use) <- cells.use
+colnames(mat.use) <- cells.use
+
+# 3. 设置节点大小（根据你的 groupSize 子集提取）
+groupSize.use <- groupSize[cells.use]
+
+
+# 4. 绘制
+pdf("Pic/CD_Number_of_interactions.pdf", width = 8, height = 8)
+netVisual_circle(mat.use,
+                 vertex.weight = groupSize.use,
+                 weight.scale = TRUE,
+                 label.edge = FALSE,
+                 title.name = "Number of interactions")
+dev.off()
+pdf("Pic/CD_Interaction_strength.pdf", width = 8, height = 8)
+netVisual_circle(mat.use2,
+                 vertex.weight = groupSize.use,
+                 weight.scale = T,
+                 label.edge = F,
+                 title.name = "Interaction weights/strength")
+dev.off()
+
+
+#左图：外周圆圈大小表示细胞数量，越大数量越多
+#发出箭头的细胞表达配体，箭头指向细胞表达受体，配对越多线越粗
+#右图：互作的概率/强度值（强度就是概率值相加）
+
+#展示每个亚群作为source的信号传递
+mat <- stim.cellchat@net$weight #提取每个细胞的互作强度
+par(mfrow = c(4,4),mar = c(1,1,1,1))
+for(i in 1:nrow(mat)){
+  mat2 <- matrix(0,nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2,
+                   vertex.weight = groupSize,
+                   arrow.width = 0.2, arrow.size = 0.1,
+                   weight.scale = T,
+                   edge.weight.max = max(mat),
+                   title.name = rownames(mat)[i])
+}
+
+par(mfrow = c(2,2),mar = c(1,1,1,1)) 
+mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+mat2[1, ] <- mat[1, ] 
+netVisual_circle(mat2,
+                 vertex.weight = groupSize,
+                 arrow.width = 0.2, arrow.size = 0.1, #自行调整
+                 weight.scale = T,
+                 edge.weight.max = max(mat),
+                 title.name = rownames(mat)[1]) 
+
+#pathway选择感兴趣的通路进行可视化
+#层级图
+stim.cellchat@netP$pathways
+pathway.show <- group1.net$pathway_name
+pathway.show <- "CCL" #指定生物学通路，根据研究选择来解释生物学意义
+#CCL调趋化因子，通过调节白细胞的迁移和定向，参与炎症反应、免疫应答和组织修复
+levels(stim.cellchat@idents)
+vertex.receiver = c(1,2,5,6,7,11,13) #淋巴对髓系
+netVisual_aggregate(stim.cellchat,
+                    signaling = pathway.show,
+                    vertex.receiver = vertex.receiver,
+                    layout = "hierarchy")
+#左图中间与左边相同，左半区箭头代表自分泌，右半区是互作
+#右图中间与右边相同，与上类似
+
+#circle plot
+par(mfrow = c(1,1))
+netVisual_aggregate(stim.cellchat,
+                    signaling = pathway.show,
+                    layout = "circle")
+#chord plot
+par(mfrow = c(1,1))
+netVisual_aggregate(stim.cellchat,
+                    signaling = pathway.show,
+                    layout = "chord")
+#热图
+netVisual_heatmap(stim.cellchat, signaling = pathway.show, color.heatmap = "Reds")
+
+
+#计算受配体对整个信号通路的贡献，并可视化单个配体-受体对介导的细胞-细胞通讯
+netAnalysis_contribution(stim.cellchat, signaling = pathway.show)
+#可视化由单个配体-受体对介导的细胞间通讯
+pairLR.CCL <- extractEnrichedLR(stim.cellchat,
+                                signaling = pathway.show,
+                                geneLR.return = F)
+#提取对这个通路贡献最大的配受体对来展示
+LR.show <- pairLR.CCL[1,]
+netVisual_individual(stim.cellchat,
+                     signaling = pathway.show,
+                     pairLR.use = LR.show,
+                     layout = "circle")
+netVisual_individual(stim.cellchat,
+                     signaling = pathway.show,
+                     pairLR.use = LR.show,
+                     layout = "chord")
+
+
+levels(stim.cellchat@idents)
+#选择CD14 Mono，查看其配体和其他细胞受体
+netVisual_bubble(stim.cellchat,
+                 sources.use = "Enteroendocrine cells", #可以改细胞
+                 remove.isolate = F,
+                 font.size = 14)
+#选择淋巴细胞对应髓系细胞，source和targets.use的选择
+p = netVisual_bubble(uc.cellchat, sources.use = c(1,6,10,27),
+                     targets.use = c(2,12,16,17,26), remove.isolate = F)
+p
+ggsave("Pic/UC_pathway.pdf", p,width = 10,height = 12)
+
+#指定"CCL","CXCL"两个信号通路
+netVisual_bubble(stim.cellchat, sources.use = c(1,6,10,27),
+                 targets.use = c(2,12,16,17,26),
+                 signaling = c("BMP","CCL","CD99"), remove.isolate = F)
+
+#参与某条信号通路的所有基因在细胞群中表达情况展示
+p3 <- plotGeneExpression(uc.cellchat, signaling = c("BMP","TNF","WNT","CCL","CD99","CXCL"))
+p3
+ggsave("Pic/UC_pathway_cho.pdf", p3,width = 10,height = 12)
+library(RColorBrewer)
+colors <- brewer.pal(8,"Oranges")
+plotGeneExpression(stim.cellchat, signaling = "VISFATIN", type = "dot", col = colors)
+
+
+##计算和可视化网络中心性评分
+#主要注意sender和receiver
+stim.cellchat <- netAnalysis_computeCentrality(stim.cellchat, slot.name = "netP")
+netAnalysis_signalingRole_network(stim.cellchat, signaling = pathway.show,
+                                  width = 13, height = 13, font.size = 10)
+#使用散点图在2D空间中可视化主要的发送者（源）和接收者（目标）
+p4 <- netAnalysis_signalingRole_scatter(uc.cellchat)
+p4
+ggsave("Pic/UC_main_join.pdf", p4,width = 10,height = 10)
+
+netAnalysis_signalingRole_scatter(stim.cellchat, signaling = c("CXCL","CCL"))
+
+#识别对某些细胞类群的输出和输入信号贡献最大的信号
+pdf("Pic/UC_pathheat_out.pdf", width = 8, height = 15)
+p5 <- netAnalysis_signalingRole_heatmap(uc.cellchat, pattern = "outgoing")
+draw(p5, heatmap_width = unit(20, "cm"), heatmap_height = unit(35, "cm"))
+dev.off()
+pdf("Pic/UC_pathheat_in.pdf", width = 8, height = 15)
+p6 <- netAnalysis_signalingRole_heatmap(uc.cellchat, pattern = "incoming")
+draw(p6, heatmap_width = unit(20, "cm"), heatmap_height = unit(35, "cm"))
+dev.off()
+
+
+netAnalysis_signalingRole_heatmap(stim.cellchat,
+                                  signaling = c("CXCL","CCL"),
+                                  pattern = "outgoing")
+netAnalysis_signalingRole_heatmap(stim.cellchat,
+                                  signaling = c("CXCL","CCL"),
+                                  pattern = "incoming")
+
+#分泌细胞的信号流出通过寻模式的鉴定和可视化（）细胞通讯的聚类
+library(NMF)
+library(ggalluvial)
+
+selectK(uc.cellchat, pattern = "outgoing")
+nPatterns = 2 #挑选曲线中第一个出现下降的点
+uc.cellchat <- identifyCommunicationPatterns(uc.cellchat,
+                                               pattern = "outgoing",
+                                               k = nPatterns,
+                                               width = 5,
+                                               height = 9,
+                                               font.size = 6)
+# #
+# selectK(stim.cellchat, pattern = "outgoing")
+# nPatterns = 2 #
+# stim.cellchat <- identifyCommunicationPatterns(stim.cellchat,
+#                                                pattern = "outgoing",
+#                                                k = nPatterns,
+#                                                width = 5,
+#                                                height = 9,
+#                                                font.size = 6)
+# #
+p7 <- netAnalysis_river(uc.cellchat, pattern = "outgoing")
+ggsave("Pic/UC_river.pdf", p7,width = 20,height = 10)
+#
+netAnalysis_dot(stim.cellchat, pattern = "outgoing")
+
+
+###CTRL和STIM组间比较
+##CTRL组cellchat分析
+stim.object <- subset(immune.combined, group == "CD") 
+stim.data.input <- GetAssayData(stim.object, assay = "RNA", slot = "data") 
+stim.meta <- stim.object@meta.data[,c("celltype_fin","group")] 
+stim.meta$CellType %<>% as.vector(.)
+stim.cellchat <- createCellChat(object = stim.data.input) 
+stim.cellchat <- addMeta(stim.cellchat, meta = stim.meta)
+stim.cellchat <- setIdent(stim.cellchat, ident.use = "celltype_fin")
+stim.cellchat@DB <- CellChatDB.human
+stim.cellchat <- subsetData(stim.cellchat)
+future::plan("multisession", workers = 5)
+stim.cellchat <- identifyOverExpressedGenes(stim.cellchat)
+stim.cellchat <- identifyOverExpressedInteractions(stim.cellchat)
+stim.cellchat <- projectData(stim.cellchat, PPI.human)
+stim.cellchat <- computeCommunProb(stim.cellchat)
+stim.cellchat <- filterCommunication(stim.cellchat, min.cells = 10)
+stim.cellchat <- computeCommunProbPathway(stim.cellchat)
+stim.cellchat <- aggregateNet(stim.cellchat)
+stim.cellchat <- netAnalysis_computeCentrality(stim.cellchat, slot.name = "netP")
+
+saveRDS(stim.cellchat, "stim.cellchat.rds")
+
+##可视化
+stim.cellchat <- readRDS("stim.cellchat.rds")
+ctrl.cellchat <- readRDS("ctrl.cellchat.rds")
+
+#合并两组结果
+object.list <- list(HC = ctrl.cellchat, CD = stim.cellchat, UC = uc.cellchat)
+cellchat <- mergeCellChat(object.list, add.names = names(object.list))
+
+##细胞间互作次数bar图
+#比较两组互作数目
+gg1 <- compareInteractions(cellchat, show.legend = F, group = c(1,2,3))
+gg2 <- compareInteractions(cellchat, show.legend = F, group = c(1,2,3),
+                           measure = "weight")
+gg1+gg2
+
+#互作次数网络图
+# par(mfrow = c(1,2), xpd = T)
+# netVisual_diffInteraction(cellchat, weight.scale = T)
+# netVisual_diffInteraction(cellchat, weight.scale = T, measure = "weight")
+
+#数量与强度差异热图
+par(mfrow = c(1,2))
+h1 <- netVisual_heatmap(cellchat)
+h2 <- netVisual_heatmap(cellchat,measure = "weight")
+h1+h2
+
+#保守和特异性信号通路的识别和可视化
+gq1 <- rankNet(cellchat, mode = "comparison", stacked = T, do.stat = T)
+gq2 <- rankNet(cellchat, mode = "comparison", stacked = F, do.stat = T)
+gq1+gq2
+ggsave("Pic/CD_UC_diff.pdf", gq1,width = 10,height = 15)
+
+
+diff.count <- cellchat@net$CD$count - cellchat@net$UC$count
+write.csv(cellchat@net$UC$count, "csv/output_UCcount.csv", quote = F)
+write.csv(cellchat@net$CD$count, "csv/output_CDcount.csv", quote = F)
+
+library(pheatmap)
+pheatmap(diff.count,
+         treeheight_row = "0", treeheight_col = "0",
+         cluster_rows = T,
+         cluster_cols = T)
+
+
+View(cellchat)
+View(cellchat@LR[["STIM"]][["LRsig"]])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
